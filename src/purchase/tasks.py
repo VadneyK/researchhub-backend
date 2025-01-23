@@ -1,12 +1,17 @@
+from celery import shared_task
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from web3.middleware import geth_poa_middleware
 
 from mailing_list.lib import base_email_context
 from paper.models import Paper
-from purchase.models import Purchase, Support
+from purchase.models import Fundraise, Purchase, Support
 from researchhub.celery import QUEUE_NOTIFICATION, app
 from researchhub.settings import BASE_FRONTEND_URL
 from researchhub_document.models import ResearchhubPost
+from user.models import User
 from utils.message import send_email_message
+from utils.web3_utils import web3_provider
 
 
 @app.task
@@ -138,3 +143,67 @@ def send_support_email(
             context,
             html_template="support_receipt.html",
         )
+
+
+@shared_task
+def mint_fundraise_nfts(user_id, fundraise_id, contribution_amount):
+    """
+    Mint NFTs based on contribution amount and fundraise settings
+    """
+    user = User.objects.get(id=user_id)
+    fundraise = Fundraise.objects.get(id=fundraise_id)
+
+    # Check if NFT should be minted
+    if not fundraise.has_nft or contribution_amount < fundraise.min_rsc_for_nft:
+        return None
+
+    w3 = web3_provider.base
+    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+
+    contract_address = w3.to_checksum_address(settings.FUNDRAISE_NFT_CONTRACT_ADDRESS)
+    contract = w3.eth.contract(
+        address=contract_address, abi=settings.FUNDRAISE_NFT_CONTRACT_ABI
+    )
+
+    # Set metadata if not already set
+    if not contract.functions.fundraiseMetadata(fundraise.id).call():
+        metadata_tx = contract.functions.setFundraiseMetadata(
+            fundraise.id,
+            fundraise.nft_image_url or "https://default-nft-image.researchhub.com",
+            fundraise.nft_name or f"ResearchHub Fundraise #{fundraise.id}",
+            fundraise.nft_description or "ResearchHub Fundraise NFT",
+        ).build_transaction(
+            {
+                "from": settings.WEB3_WALLET_ADDRESS,
+                "nonce": w3.eth.get_transaction_count(settings.WEB3_WALLET_ADDRESS),
+                "maxFeePerGas": w3.eth.max_priority_fee + (2 * 10**9),
+                "maxPriorityFeePerGas": 2 * 10**9,
+            }
+        )
+
+        signed_tx = w3.eth.account.sign_transaction(
+            metadata_tx, settings.WEB3_PRIVATE_KEY
+        )
+        w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        w3.eth.wait_for_transaction_receipt(signed_tx.hash)
+
+    # Mint NFT
+    mint_tx = contract.functions.mint(
+        user.wallet_address, fundraise.id
+    ).build_transaction(
+        {
+            "from": settings.WEB3_WALLET_ADDRESS,
+            "nonce": w3.eth.get_transaction_count(settings.WEB3_WALLET_ADDRESS),
+            "maxFeePerGas": w3.eth.max_priority_fee + (2 * 10**9),
+            "maxPriorityFeePerGas": 2 * 10**9,
+        }
+    )
+
+    signed_tx = w3.eth.account.sign_transaction(mint_tx, settings.WEB3_PRIVATE_KEY)
+    tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+    if receipt["status"] != 1:
+        raise Exception("Transaction failed")
+
+    return receipt["transactionHash"].hex()

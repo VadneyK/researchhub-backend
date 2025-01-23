@@ -8,6 +8,13 @@ ENV PYTHONUNBUFFERED 1
 #    && rm -rf /tmp/pip-tmp
 
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
-    && apt-get -y install --no-install-recommends redis-tools
+    && apt-get -y install --no-install-recommends \
+    redis-tools \
+    build-essential \
+    libc6 \
+    libc6-dev \
+    gcc \
+    python3-dev \
+    git
 
 RUN pip --no-cache-dir install --upgrade pip poetry

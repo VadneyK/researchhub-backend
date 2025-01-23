@@ -52,6 +52,9 @@ class Fundraise(DefaultModel):
     # value fields
     goal_amount = models.DecimalField(default=0, decimal_places=10, max_digits=19)
     goal_currency = models.CharField(max_length=16, default=USD)
+    total_nfts = models.PositiveIntegerField(
+        help_text="Total number of NFTs to be distributed for this fundraise", default=0
+    )
 
     # time fields
     start_date = models.DateTimeField(auto_now_add=True)
@@ -62,13 +65,22 @@ class Fundraise(DefaultModel):
         default=get_default_expiration_date,
     )
 
+    has_nft = models.BooleanField(default=False)
+    nft_image_url = models.URLField(null=True, blank=True)
+    nft_name = models.CharField(max_length=255, null=True, blank=True)
+    nft_description = models.TextField(null=True, blank=True)
+    min_rsc_for_nft = models.DecimalField(
+        max_digits=19, decimal_places=10, default=1000  # Default 1000 RSC minimum
+    )
+
     def is_expired(self):
         if self.end_date:
             return self.end_date < datetime.now(pytz.UTC)
         return False
 
     def get_amount_raised(self, currency=USD):
-        # Since purchases.amount is a `CharField`, we need to cast it to a `DecimalField` to perform aggregation.
+        # Since purchases.amount is a `CharField`,
+        # we need to cast it to a `Decimal Field` to perform aggregation.
         rsc_amount = (
             self.purchases.annotate(
                 amount_decimal=models.functions.Cast(

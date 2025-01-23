@@ -1,4 +1,5 @@
 import decimal
+import math
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
@@ -14,8 +15,10 @@ from purchase.related_models.constants import (
     MINIMUM_FUNDRAISE_CONTRIBUTION_AMOUNT_RSC,
 )
 from purchase.related_models.constants.currency import RSC, USD
+from purchase.related_models.rsc_exchange_rate_model import RscExchangeRate
 from purchase.serializers.fundraise_serializer import DynamicFundraiseSerializer
 from purchase.serializers.purchase_serializer import DynamicPurchaseSerializer
+from purchase.tasks import mint_fundraise_nfts
 from reputation.models import BountyFee, Escrow
 from reputation.utils import calculate_bounty_fees, deduct_bounty_fees
 from researchhub_document.models import ResearchhubPost, ResearchhubUnifiedDocument
@@ -88,7 +91,22 @@ class FundraiseViewSet(viewsets.ModelViewSet):
         # So we require a recipient_user_id, which gets set as the created_by user for the fundraise/escrow.
         # In the future, when users can create their own fundraises, we can remove this.
         recipient_user_id = data.get("recipient_user_id", None)
+        total_nfts = data.get("total_nfts", None)
         post_id = data.get("post_id", None)
+
+        # Validate total_nfts
+        if total_nfts is None:
+            return Response({"message": "total_nfts is required"}, status=400)
+        try:
+            total_nfts = decimal.Decimal(total_nfts)
+            if total_nfts < 0:
+                return Response(
+                    {"message": "total_nfts must be greater than or equal to 0"},
+                    status=400,
+                )
+        except Exception as e:
+            log_error(e)
+            return Response({"detail": "Invalid total_nfts value"}, status=400)
 
         # Validate body
         if goal_amount is None:
@@ -165,6 +183,7 @@ class FundraiseViewSet(viewsets.ModelViewSet):
                 unified_document=unified_document,
                 goal_amount=goal_amount,
                 goal_currency=goal_currency,
+                total_nfts=total_nfts,
                 status=Fundraise.OPEN,
             )
             # Create escrow object
@@ -281,6 +300,22 @@ class FundraiseViewSet(viewsets.ModelViewSet):
             if user_balance - (amount + fee) < 0:
                 return Response({"message": "Insufficient balance"}, status=400)
 
+            try:
+                # Calculate NFTs to mint before creating any objects
+                nfts_to_mint = calculate_nfts_to_mint(amount, fundraise)
+
+                if nfts_to_mint > 0:
+                    mint_fundraise_nfts.delay(
+                        user_id=request.user.id,
+                        fundraise_id=fundraise.id,
+                        amount=nfts_to_mint,
+                    )
+            except Exception as e:
+                log_error(e)
+                return Response(
+                    {"message": "Failed to process NFT minting"}, status=400
+                )
+
             # Create purchase object
             # In the future, we may want to have the user POST /purchases and then call this EP with an ID.
             # Especially for on-chain purchases.
@@ -369,3 +404,21 @@ class FundraiseViewSet(viewsets.ModelViewSet):
         context = self._purchase_serializer_context()
         serializer = DynamicPurchaseSerializer(purchases, context=context, many=True)
         return Response(serializer.data)
+
+
+def calculate_nfts_to_mint(contribution_amount: int, fundraise: Fundraise) -> int:
+    """
+    Calculate number of NFTs to mint based on contribution amount in RSC
+    """
+    if fundraise.total_nfts == 0:
+        return 0
+
+    if fundraise.goal_currency == USD:
+        # Convert goal USD amount to RSC for calculation
+        goal_amount_rsc = RscExchangeRate.usd_to_rsc(fundraise.goal_amount)
+        nft_price_rsc = goal_amount_rsc / int(fundraise.total_nfts)
+        return math.floor(contribution_amount / nft_price_rsc)
+    else:
+        # Direct RSC calculation if goal is in RSC
+        nft_price_rsc = fundraise.goal_amount / int(fundraise.total_nfts)
+        return math.floor(contribution_amount / nft_price_rsc)
